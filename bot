@@ -4,7 +4,9 @@ import os
 import re
 import threading
 import urllib.request
+from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
@@ -20,6 +22,7 @@ from aiogram.utils import executor
 from storage import (
     load_playlists, save_playlists,
     load_music_cache, save_music_cache,
+    load_todos, save_todos,
 )
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -35,7 +38,7 @@ TELEGRAM_POST_RE = re.compile(r"(?:https?://)?t\.me/([^/\s]+)/(\d+)")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-active_sessions: dict = {}
+active_sessions: dict = {}  # user_id -> {"task": task_obj, "task_name": str, "minutes": int}
 waiting_for_thief: dict = {}
 
 TIMER_LABELS = {
@@ -47,6 +50,7 @@ TIMER_LABELS = {
 }
 STOP_BTN = "⏹ Остановить сессию"
 MUSIC_BTN = "🎵 Музыка"
+TODOS_BTN = "📋 Мои задачи"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -67,11 +71,13 @@ def get_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         kb.add(KeyboardButton(STOP_BTN))
         if has_playlist:
             kb.add(KeyboardButton(MUSIC_BTN))
+        kb.add(KeyboardButton(TODOS_BTN))
         return kb
 
     kb.add(KeyboardButton("▶️ Старт 25 мин"), KeyboardButton("▶️ Старт 40 мин"))
     kb.add(KeyboardButton("▶️ Старт 60 мин"), KeyboardButton("▶️ Старт 90 мин"))
     kb.add(KeyboardButton("▶️ Старт 120 мин"))
+    kb.add(KeyboardButton(TODOS_BTN))
     if has_playlist:
         kb.add(KeyboardButton("🎵 Мой плейлист"), KeyboardButton("❌ Удалить плейлист"))
     else:
@@ -88,7 +94,6 @@ def get_webapp_inline_keyboard() -> InlineKeyboardMarkup | None:
 
 
 async def set_menu_button():
-    """Set the chat menu button to open the mini app (shows as a button left of the text field)."""
     if not WEBAPP_URL:
         return
     loop = asyncio.get_event_loop()
@@ -99,7 +104,7 @@ async def set_menu_button():
         data = urllib.parse.urlencode({
             "menu_button": json.dumps({
                 "type": "web_app",
-                "text": "🎯 Таймер",
+                "text": "🎯 Задачи",
                 "web_app": {"url": WEBAPP_URL},
             })
         }).encode()
@@ -156,14 +161,34 @@ async def send_playlist(chat_id: int, url: str):
     await bot.send_message(chat_id=chat_id, text=f"🎵 Включай плейлист:\n{url}")
 
 
-async def run_timer(user_id: int, chat_id: int, minutes: int):
+async def run_timer(user_id: int, chat_id: int, minutes: int, task_name: str = None):
     try:
         await asyncio.sleep(minutes * 60)
+        
+        # Сохраняем задачу в историю если она была
+        if task_name:
+            todos_data = load_todos(str(user_id))
+            today_str = date.today().isoformat()
+            
+            # Удаляем из активных задач
+            todos_data["tasks"] = [t for t in todos_data["tasks"] if t.get("name") != task_name or t.get("date") != today_str]
+            
+            # Добавляем в историю
+            todos_data["history"].append({
+                "name": task_name,
+                "date": today_str,
+                "duration": minutes,
+                "completed_at": datetime.now().isoformat()
+            })
+            save_todos(str(user_id), todos_data)
+        
         active_sessions.pop(user_id, None)
+        
+        task_text = f" на задачу «{task_name}»" if task_name else ""
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⏰ Сессия {minutes} минут завершена!\n\n"
+                f"⏰ Сессия {minutes} минут{task_text} завершена!\n\n"
                 "Ты продержался — отличная работа.\n"
                 "Сделай перерыв, встань, подыши.\n\n"
                 "Готов к следующему раунду? Нажми ▶️ или открой таймер 🎯"
@@ -174,6 +199,104 @@ async def run_timer(user_id: int, chat_id: int, minutes: int):
         pass
 
 
+# ── Команды задач ──────────────────────────────────────────────────────────
+
+@dp.message_handler(commands=["todos"])
+async def cmd_show_todos(msg: types.Message):
+    todos_data = load_todos(str(msg.from_user.id))
+    today_str = date.today().isoformat()
+    today_tasks = [t for t in todos_data["tasks"] if t.get("date") == today_str]
+    
+    if not today_tasks:
+        await msg.answer(
+            "📋 На сегодня задач нет.\n\n"
+            "Добавь задачи через мини-приложение (кнопка 🎯 Задачи) "
+            "или командой /addtask <задача>"
+        )
+        return
+    
+    task_list = "\n".join([f"• {t['name']}" for t in today_tasks])
+    await msg.answer(
+        f"📋 Задачи на сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n{task_list}\n\n"
+        f"✅ Выполнено сегодня: {len(todos_data['history'])} задач"
+    )
+
+
+@dp.message_handler(commands=["addtask"])
+async def cmd_add_task(msg: types.Message):
+    task_name = msg.get_args().strip()
+    if not task_name:
+        await msg.answer("Укажи название задачи.\nПример: /addtask Написать отчет")
+        return
+    
+    todos_data = load_todos(str(msg.from_user.id))
+    today_str = date.today().isoformat()
+    
+    # Проверяем, нет ли уже такой задачи на сегодня
+    existing = [t for t in todos_data["tasks"] if t.get("name") == task_name and t.get("date") == today_str]
+    if existing:
+        await msg.answer("❌ Такая задача уже есть на сегодня!")
+        return
+    
+    todos_data["tasks"].append({
+        "name": task_name,
+        "date": today_str,
+        "created_at": datetime.now().isoformat()
+    })
+    save_todos(str(msg.from_user.id), todos_data)
+    await msg.answer(f"✅ Задача «{task_name}» добавлена на сегодня!", reply_markup=get_keyboard(msg.from_user.id))
+
+
+@dp.message_handler(commands=["removetask"])
+async def cmd_remove_task(msg: types.Message):
+    task_name = msg.get_args().strip()
+    if not task_name:
+        await msg.answer("Укажи название задачи.\nПример: /removetask Написать отчет")
+        return
+    
+    todos_data = load_todos(str(msg.from_user.id))
+    today_str = date.today().isoformat()
+    
+    original_len = len(todos_data["tasks"])
+    todos_data["tasks"] = [t for t in todos_data["tasks"] if not (t.get("name") == task_name and t.get("date") == today_str)]
+    
+    if len(todos_data["tasks"]) < original_len:
+        save_todos(str(msg.from_user.id), todos_data)
+        await msg.answer(f"✅ Задача «{task_name}» удалена!")
+    else:
+        await msg.answer("❌ Задача не найдена.")
+
+
+@dp.message_handler(commands=["stats"])
+async def cmd_stats(msg: types.Message):
+    todos_data = load_todos(str(msg.from_user.id))
+    history = todos_data["history"]
+    
+    if not history:
+        await msg.answer("📊 Статистика пока пуста. Выполни несколько сессий!")
+        return
+    
+    total_sessions = len(history)
+    total_minutes = sum(h["duration"] for h in history)
+    avg_duration = total_minutes / total_sessions if total_sessions else 0
+    
+    # Группировка по дням
+    days_stats = {}
+    for h in history:
+        day = h["date"]
+        days_stats[day] = days_stats.get(day, 0) + 1
+    
+    best_day = max(days_stats.items(), key=lambda x: x[1]) if days_stats else (None, 0)
+    
+    await msg.answer(
+        f"📊 Твоя статистика:\n\n"
+        f"• Всего сессий: {total_sessions}\n"
+        f"• Всего минут: {total_minutes}\n"
+        f"• Средняя длительность: {avg_duration:.0f} мин\n"
+        f"• Лучший день: {best_day[0]} ({best_day[1]} задач)" if best_day[0] else "• Лучший день: пока нет"
+    )
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @dp.message_handler(commands=["start"])
@@ -181,12 +304,17 @@ async def cmd_start(msg: types.Message):
     inline_kb = get_webapp_inline_keyboard()
     text = (
         "Готов работать? 💪\n\n"
-        "Открой таймер кнопкой ниже — она также закреплена вверху чата.\n"
-        "Плейлист: /setplaylist <ссылка>"
+        "📋 Управляй задачами через мини-приложение (кнопка 🎯 Задачи)\n"
+        "🎵 Плейлист: /setplaylist <ссылка>\n"
+        "📊 Статистика: /stats\n\n"
+        "Также доступны команды:\n"
+        "/addtask <задача> - добавить задачу\n"
+        "/removetask <задача> - удалить задачу\n"
+        "/todos - показать задачи на сегодня"
     )
     await msg.answer(text, reply_markup=get_keyboard(msg.from_user.id))
     if inline_kb:
-        timer_msg = await msg.answer("🎯 Нажми чтобы открыть таймер:", reply_markup=inline_kb)
+        timer_msg = await msg.answer("🎯 Нажми чтобы открыть задачи и таймер:", reply_markup=inline_kb)
         try:
             await bot.pin_chat_message(
                 chat_id=msg.chat.id,
@@ -197,37 +325,12 @@ async def cmd_start(msg: types.Message):
             pass
 
 
-# ── Playlist commands ─────────────────────────────────────────────────────────
-
-@dp.message_handler(commands=["setplaylist"])
-async def cmd_set_playlist(msg: types.Message):
-    args = msg.get_args().strip()
-    if not args:
-        await msg.answer("Укажи ссылку.\nПример: /setplaylist https://t.me/channelname/2")
-        return
-    playlists = load_playlists()
-    playlists[str(msg.from_user.id)] = args
-    save_playlists(playlists)
-    tg_post = parse_telegram_post(args)
-    text = (
-        "✅ Плейлист сохранён! Telegram-пост будет переслан при старте сессии."
-        if tg_post else
-        "✅ Плейлист сохранён! Ссылка будет отправлена при старте."
-    )
-    await msg.answer(text, reply_markup=get_keyboard(msg.from_user.id))
-
-
-@dp.message_handler(commands=["myplaylist"])
-async def cmd_my_playlist(msg: types.Message):
-    playlists = load_playlists()
-    url = playlists.get(str(msg.from_user.id))
-    if url:
-        await msg.answer(f"🎵 Твой плейлист:\n{url}")
-    else:
-        await msg.answer("Нет плейлиста. Добавь через /setplaylist <ссылка>")
-
-
 # ── Keyboard buttons ──────────────────────────────────────────────────────────
+
+@dp.message_handler(lambda msg: msg.text == TODOS_BTN)
+async def btn_show_todos(msg: types.Message):
+    await cmd_show_todos(msg)
+
 
 @dp.message_handler(lambda msg: msg.text == "🎵 Добавить плейлист")
 async def btn_add_playlist(msg: types.Message):
@@ -274,22 +377,65 @@ async def start_timer(msg: types.Message):
     if uid in active_sessions:
         await msg.answer("У тебя уже идёт сессия. Останови её перед началом новой.")
         return
+    
     minutes = TIMER_LABELS[msg.text]
     playlists = load_playlists()
     url = playlists.get(str(uid), DEFAULT_MUSIC_URL)
-    await msg.answer(f"Фокус на {minutes} минут. Не сливайся.")
-    await send_playlist(msg.chat.id, url)
-    task = asyncio.create_task(run_timer(uid, msg.chat.id, minutes))
-    active_sessions[uid] = task
-    await msg.answer("Сессия идёт. Удачи.", reply_markup=get_keyboard(uid))
+    
+    # Проверяем, есть ли задача без таймера
+    todos_data = load_todos(str(uid))
+    today_str = date.today().isoformat()
+    pending_tasks = [t for t in todos_data["tasks"] if t.get("date") == today_str]
+    
+    if pending_tasks:
+        # Спрашиваем, на какую задачу запустить таймер
+        kb = InlineKeyboardMarkup(row_width=1)
+        for task in pending_tasks[:5]:  # Ограничиваем 5 задачами
+            kb.add(InlineKeyboardButton(task["name"], callback_data=f"task_{task['name']}"))
+        kb.add(InlineKeyboardButton("❌ Без задачи", callback_data="task_none"))
+        await msg.answer("Выбери задачу для этой сессии:", reply_markup=kb)
+        # Сохраняем параметры сессии
+        waiting_for_thief[uid] = {"minutes": minutes, "url": url, "chat_id": msg.chat.id}
+    else:
+        # Запускаем без задачи
+        await msg.answer(f"Фокус на {minutes} минут. Не сливайся.")
+        await send_playlist(msg.chat.id, url)
+        task = asyncio.create_task(run_timer(uid, msg.chat.id, minutes, None))
+        active_sessions[uid] = {"task": task, "task_name": None, "minutes": minutes}
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("task_"))
+async def process_task_selection(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    session_data = waiting_for_thief.pop(uid, None)
+    
+    if not session_data:
+        await callback.answer("Сессия не найдена. Попробуй снова.")
+        return
+    
+    task_name = callback.data[5:]  # убираем "task_"
+    if task_name == "none":
+        task_name = None
+    
+    minutes = session_data["minutes"]
+    url = session_data["url"]
+    chat_id = session_data["chat_id"]
+    
+    await callback.message.delete()
+    await callback.message.answer(f"Фокус на {minutes} минут{', задача: ' + task_name if task_name else ''}. Не сливайся.")
+    await send_playlist(chat_id, url)
+    
+    task = asyncio.create_task(run_timer(uid, chat_id, minutes, task_name))
+    active_sessions[uid] = {"task": task, "task_name": task_name, "minutes": minutes}
+    await callback.answer()
 
 
 @dp.message_handler(lambda msg: msg.text == STOP_BTN)
 async def stop_timer(msg: types.Message):
     uid = msg.from_user.id
-    task = active_sessions.pop(uid, None)
-    if task:
-        task.cancel()
+    session = active_sessions.pop(uid, None)
+    if session and session["task"]:
+        session["task"].cancel()
     waiting_for_thief[uid] = True
     await msg.answer(
         "Сессия остановлена.\n\nКто или что украло твой фокус?",
@@ -308,18 +454,53 @@ async def handle_webapp_data(msg: types.Message):
         return
 
     action = data.get("action")
-    minutes = data.get("minutes", 0)
-
-    if action == "start":
+    
+    if action == "save_tasks":
+        # Сохраняем список задач из мини-приложения
+        tasks = data.get("tasks", [])
+        today_str = date.today().isoformat()
+        todos_data = load_todos(str(uid))
+        todos_data["tasks"] = [{"name": t, "date": today_str, "created_at": datetime.now().isoformat()} for t in tasks]
+        save_todos(str(uid), todos_data)
+        await msg.answer(f"✅ Сохранено {len(tasks)} задач на сегодня!", reply_markup=get_keyboard(uid))
+    
+    elif action == "start_task":
+        task_name = data.get("task_name")
+        minutes = data.get("minutes", 25)
+        
+        if uid in active_sessions:
+            await msg.answer("У тебя уже идёт сессия. Останови её перед началом новой.")
+            return
+        
         playlists = load_playlists()
         url = playlists.get(str(uid), DEFAULT_MUSIC_URL)
+        
         await msg.answer(
-            f"🎯 Сессия {minutes} минут начата!\nНе сливайся.",
+            f"🎯 Сессия {minutes} минут на задачу «{task_name}» начата!\nНе сливайся.",
             reply_markup=get_keyboard(uid),
         )
         await send_playlist(msg.chat.id, url)
+        
+        task = asyncio.create_task(run_timer(uid, msg.chat.id, minutes, task_name))
+        active_sessions[uid] = {"task": task, "task_name": task_name, "minutes": minutes}
 
     elif action == "complete":
+        minutes = data.get("minutes", 0)
+        task_name = data.get("task_name")
+        
+        # Отмечаем задачу как выполненную
+        if task_name:
+            todos_data = load_todos(str(uid))
+            today_str = date.today().isoformat()
+            todos_data["tasks"] = [t for t in todos_data["tasks"] if not (t.get("name") == task_name and t.get("date") == today_str)]
+            todos_data["history"].append({
+                "name": task_name,
+                "date": today_str,
+                "duration": minutes,
+                "completed_at": datetime.now().isoformat()
+            })
+            save_todos(str(uid), todos_data)
+        
         await msg.answer(
             f"⏰ Сессия {minutes} минут завершена!\n\n"
             "Ты продержался — отличная работа 💪\n"
@@ -338,7 +519,7 @@ async def handle_webapp_data(msg: types.Message):
 
 # ── "Who stole focus" answer ──────────────────────────────────────────────────
 
-@dp.message_handler(lambda msg: msg.from_user.id in waiting_for_thief)
+@dp.message_handler(lambda msg: msg.from_user.id in waiting_for_thief and not isinstance(waiting_for_thief.get(msg.from_user.id), dict))
 async def handle_thief(msg: types.Message):
     uid = msg.from_user.id
     waiting_for_thief.pop(uid, None)
@@ -348,7 +529,7 @@ async def handle_thief(msg: types.Message):
     )
 
 
-# ── Dev startup (polling + local music API) ───────────────────────────────────
+# ── Music API ─────────────────────────────────────────────────────────────────
 
 class _MusicAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -384,7 +565,6 @@ def _start_music_api_server():
 
 
 async def _on_startup(_dp):
-    # Remove any webhook set by the production server so polling works in dev
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
