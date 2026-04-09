@@ -1,0 +1,399 @@
+import asyncio
+import json
+import os
+import re
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+)
+from aiogram.utils import executor
+
+from storage import (
+    load_playlists, save_playlists,
+    load_music_cache, save_music_cache,
+)
+
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+_domains = os.environ.get("REPLIT_DOMAINS", "") or os.environ.get("REPLIT_DEV_DOMAIN", "")
+WEBAPP_URL = f"https://{_domains.split(',')[0]}" if _domains else ""
+
+DEFAULT_MUSIC_URL = "https://t.me/musicforbot1/2"
+MUSIC_API_PORT = 8765
+
+TELEGRAM_POST_RE = re.compile(r"(?:https?://)?t\.me/([^/\s]+)/(\d+)")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+active_sessions: dict = {}
+waiting_for_thief: dict = {}
+
+TIMER_LABELS = {
+    "▶️ Старт 25 мин": 25,
+    "▶️ Старт 40 мин": 40,
+    "▶️ Старт 60 мин": 60,
+    "▶️ Старт 90 мин": 90,
+    "▶️ Старт 120 мин": 120,
+}
+STOP_BTN = "⏹ Остановить сессию"
+MUSIC_BTN = "🎵 Музыка"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def parse_telegram_post(url: str):
+    m = TELEGRAM_POST_RE.search(url)
+    if m:
+        return f"@{m.group(1)}", int(m.group(2))
+    return None
+
+
+def get_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    playlists = load_playlists()
+    has_playlist = str(user_id) in playlists
+
+    if user_id in active_sessions:
+        kb.add(KeyboardButton(STOP_BTN))
+        if has_playlist:
+            kb.add(KeyboardButton(MUSIC_BTN))
+        return kb
+
+    kb.add(KeyboardButton("▶️ Старт 25 мин"), KeyboardButton("▶️ Старт 40 мин"))
+    kb.add(KeyboardButton("▶️ Старт 60 мин"), KeyboardButton("▶️ Старт 90 мин"))
+    kb.add(KeyboardButton("▶️ Старт 120 мин"))
+    if has_playlist:
+        kb.add(KeyboardButton("🎵 Мой плейлист"), KeyboardButton("❌ Удалить плейлист"))
+    else:
+        kb.add(KeyboardButton("🎵 Добавить плейлист"))
+    return kb
+
+
+def get_webapp_inline_keyboard() -> InlineKeyboardMarkup | None:
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎯 Открыть таймер", web_app=WebAppInfo(url=WEBAPP_URL))
+    ]])
+
+
+async def set_menu_button():
+    """Set the chat menu button to open the mini app (shows as a button left of the text field)."""
+    if not WEBAPP_URL:
+        return
+    loop = asyncio.get_event_loop()
+
+    def _request():
+        import urllib.parse
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton"
+        data = urllib.parse.urlencode({
+            "menu_button": json.dumps({
+                "type": "web_app",
+                "text": "🎯 Таймер",
+                "web_app": {"url": WEBAPP_URL},
+            })
+        }).encode()
+        try:
+            urllib.request.urlopen(url, data=data)
+        except Exception:
+            pass
+
+    await loop.run_in_executor(None, _request)
+
+
+async def _cache_music_from_msg(msg: types.Message):
+    file_id = None
+    if msg.audio:
+        file_id = msg.audio.file_id
+    elif msg.voice:
+        file_id = msg.voice.file_id
+    elif msg.document:
+        file_id = msg.document.file_id
+    if not file_id:
+        return
+    try:
+        info = await bot.get_file(file_id)
+        save_music_cache({"file_id": file_id, "file_path": info.file_path})
+    except Exception:
+        pass
+
+
+async def refresh_music_cache():
+    cache = load_music_cache()
+    file_id = cache.get("file_id")
+    if not file_id:
+        return
+    try:
+        info = await bot.get_file(file_id)
+        cache["file_path"] = info.file_path
+        save_music_cache(cache)
+    except Exception:
+        pass
+
+
+async def send_playlist(chat_id: int, url: str):
+    tg_post = parse_telegram_post(url)
+    if tg_post:
+        channel, message_id = tg_post
+        try:
+            fwd = await bot.forward_message(
+                chat_id=chat_id, from_chat_id=channel, message_id=message_id
+            )
+            await _cache_music_from_msg(fwd)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id=chat_id, text=f"🎵 Включай плейлист:\n{url}")
+
+
+async def run_timer(user_id: int, chat_id: int, minutes: int):
+    try:
+        await asyncio.sleep(minutes * 60)
+        active_sessions.pop(user_id, None)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏰ Сессия {minutes} минут завершена!\n\n"
+                "Ты продержался — отличная работа.\n"
+                "Сделай перерыв, встань, подыши.\n\n"
+                "Готов к следующему раунду? Нажми ▶️ или открой таймер 🎯"
+            ),
+            reply_markup=get_keyboard(user_id),
+        )
+    except asyncio.CancelledError:
+        pass
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(msg: types.Message):
+    inline_kb = get_webapp_inline_keyboard()
+    text = (
+        "Готов работать? 💪\n\n"
+        "Открой таймер кнопкой ниже — она также закреплена вверху чата.\n"
+        "Плейлист: /setplaylist <ссылка>"
+    )
+    await msg.answer(text, reply_markup=get_keyboard(msg.from_user.id))
+    if inline_kb:
+        timer_msg = await msg.answer("🎯 Нажми чтобы открыть таймер:", reply_markup=inline_kb)
+        try:
+            await bot.pin_chat_message(
+                chat_id=msg.chat.id,
+                message_id=timer_msg.message_id,
+                disable_notification=True,
+            )
+        except Exception:
+            pass
+
+
+# ── Playlist commands ─────────────────────────────────────────────────────────
+
+@dp.message_handler(commands=["setplaylist"])
+async def cmd_set_playlist(msg: types.Message):
+    args = msg.get_args().strip()
+    if not args:
+        await msg.answer("Укажи ссылку.\nПример: /setplaylist https://t.me/channelname/2")
+        return
+    playlists = load_playlists()
+    playlists[str(msg.from_user.id)] = args
+    save_playlists(playlists)
+    tg_post = parse_telegram_post(args)
+    text = (
+        "✅ Плейлист сохранён! Telegram-пост будет переслан при старте сессии."
+        if tg_post else
+        "✅ Плейлист сохранён! Ссылка будет отправлена при старте."
+    )
+    await msg.answer(text, reply_markup=get_keyboard(msg.from_user.id))
+
+
+@dp.message_handler(commands=["myplaylist"])
+async def cmd_my_playlist(msg: types.Message):
+    playlists = load_playlists()
+    url = playlists.get(str(msg.from_user.id))
+    if url:
+        await msg.answer(f"🎵 Твой плейлист:\n{url}")
+    else:
+        await msg.answer("Нет плейлиста. Добавь через /setplaylist <ссылка>")
+
+
+# ── Keyboard buttons ──────────────────────────────────────────────────────────
+
+@dp.message_handler(lambda msg: msg.text == "🎵 Добавить плейлист")
+async def btn_add_playlist(msg: types.Message):
+    await msg.answer(
+        "Отправь: /setplaylist <ссылка>\n\n"
+        "Поддерживаются Telegram-посты, YouTube, Spotify и любые ссылки."
+    )
+
+
+@dp.message_handler(lambda msg: msg.text == "🎵 Мой плейлист")
+async def btn_my_playlist(msg: types.Message):
+    playlists = load_playlists()
+    url = playlists.get(str(msg.from_user.id))
+    await msg.answer(f"🎵 Твой плейлист:\n{url}" if url else "Плейлист не найден.")
+
+
+@dp.message_handler(lambda msg: msg.text == MUSIC_BTN)
+async def btn_music_during_session(msg: types.Message):
+    playlists = load_playlists()
+    url = playlists.get(str(msg.from_user.id))
+    if url:
+        await send_playlist(msg.chat.id, url)
+    else:
+        await msg.answer("Плейлист не найден.")
+
+
+@dp.message_handler(lambda msg: msg.text == "❌ Удалить плейлист")
+async def btn_remove_playlist(msg: types.Message):
+    playlists = load_playlists()
+    uid = str(msg.from_user.id)
+    if uid in playlists:
+        del playlists[uid]
+        save_playlists(playlists)
+        await msg.answer("🗑 Плейлист удалён.", reply_markup=get_keyboard(msg.from_user.id))
+    else:
+        await msg.answer("У тебя нет сохранённого плейлиста.")
+
+
+# ── Bot timer (keyboard-based) ────────────────────────────────────────────────
+
+@dp.message_handler(lambda msg: msg.text in TIMER_LABELS)
+async def start_timer(msg: types.Message):
+    uid = msg.from_user.id
+    if uid in active_sessions:
+        await msg.answer("У тебя уже идёт сессия. Останови её перед началом новой.")
+        return
+    minutes = TIMER_LABELS[msg.text]
+    playlists = load_playlists()
+    url = playlists.get(str(uid), DEFAULT_MUSIC_URL)
+    await msg.answer(f"Фокус на {minutes} минут. Не сливайся.")
+    await send_playlist(msg.chat.id, url)
+    task = asyncio.create_task(run_timer(uid, msg.chat.id, minutes))
+    active_sessions[uid] = task
+    await msg.answer("Сессия идёт. Удачи.", reply_markup=get_keyboard(uid))
+
+
+@dp.message_handler(lambda msg: msg.text == STOP_BTN)
+async def stop_timer(msg: types.Message):
+    uid = msg.from_user.id
+    task = active_sessions.pop(uid, None)
+    if task:
+        task.cancel()
+    waiting_for_thief[uid] = True
+    await msg.answer(
+        "Сессия остановлена.\n\nКто или что украло твой фокус?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# ── Mini app events ───────────────────────────────────────────────────────────
+
+@dp.message_handler(content_types=types.ContentTypes.WEB_APP_DATA)
+async def handle_webapp_data(msg: types.Message):
+    uid = msg.from_user.id
+    try:
+        data = json.loads(msg.web_app_data.data)
+    except Exception:
+        return
+
+    action = data.get("action")
+    minutes = data.get("minutes", 0)
+
+    if action == "start":
+        playlists = load_playlists()
+        url = playlists.get(str(uid), DEFAULT_MUSIC_URL)
+        await msg.answer(
+            f"🎯 Сессия {minutes} минут начата!\nНе сливайся.",
+            reply_markup=get_keyboard(uid),
+        )
+        await send_playlist(msg.chat.id, url)
+
+    elif action == "complete":
+        await msg.answer(
+            f"⏰ Сессия {minutes} минут завершена!\n\n"
+            "Ты продержался — отличная работа 💪\n"
+            "Сделай перерыв, встань, подыши.",
+            reply_markup=get_keyboard(uid),
+        )
+
+    elif action == "stop":
+        elapsed = data.get("elapsed_minutes", 0)
+        waiting_for_thief[uid] = True
+        await msg.answer(
+            f"Сессия остановлена (прошло ~{elapsed} мин).\n\nКто или что украло твой фокус?",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
+# ── "Who stole focus" answer ──────────────────────────────────────────────────
+
+@dp.message_handler(lambda msg: msg.from_user.id in waiting_for_thief)
+async def handle_thief(msg: types.Message):
+    uid = msg.from_user.id
+    waiting_for_thief.pop(uid, None)
+    await msg.answer(
+        f"Запомни: «{msg.text}» — твой враг.\nВ следующий раз держись крепче. 💪",
+        reply_markup=get_keyboard(uid),
+    )
+
+
+# ── Dev startup (polling + local music API) ───────────────────────────────────
+
+class _MusicAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/api/music":
+            self.send_error(404)
+            return
+        cache = load_music_cache()
+        file_path = cache.get("file_path")
+        if not file_path:
+            self.send_error(503, "Music not cached yet")
+            return
+        cdn_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        try:
+            with urllib.request.urlopen(cdn_url) as resp:
+                content = resp.read()
+                ct = resp.headers.get("Content-Type", "audio/ogg")
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as exc:
+            self.send_error(500, str(exc))
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _start_music_api_server():
+    HTTPServer(("0.0.0.0", MUSIC_API_PORT), _MusicAPIHandler).serve_forever()
+
+
+async def _on_startup(_dp):
+    # Remove any webhook set by the production server so polling works in dev
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    await set_menu_button()
+    await refresh_music_cache()
+    t = threading.Thread(target=_start_music_api_server, daemon=True)
+    t.start()
+
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True, on_startup=_on_startup)
